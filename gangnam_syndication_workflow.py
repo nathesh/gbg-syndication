@@ -50,8 +50,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("syndication")
 
 # Confidence below which we refuse to act and escalate to a human queue.
-CLINIC_MATCH_AUTO = 0.92
-CLINIC_MATCH_FLOOR = 0.60
 SIMHASH_NEAR_DUP = 3       # hamming distance <= this  => duplicate, no LLM
 SIMHASH_AMBIGUOUS = 8      # between NEAR_DUP and this => ask the model
 
@@ -107,16 +105,27 @@ class Review:
 # Model boundary -- one call site, schema-checked, never trusted raw
 # --------------------------------------------------------------------------
 
-MODEL = "claude-opus-5"
-MODE = "live" if os.environ.get("ANTHROPIC_API_KEY") else "stub"
+# Settings live in config.json next to this file. The key there is a
+# placeholder so the repo, the tests and the demo deploy run in stub mode;
+# replace it (or set ANTHROPIC_API_KEY, which wins) to go live.
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+with open(_CONFIG_PATH, encoding="utf-8") as _f:
+    CONFIG = json.load(_f)
+
+MODEL = CONFIG.get("model", "claude-sonnet-5")
+_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or CONFIG.get("anthropic_api_key", "")
+MODE = "live" if _API_KEY and not _API_KEY.startswith("REPLACE") else "stub"
 _client = None
+
+CLINIC_MATCH_AUTO = float(CONFIG.get("clinic_match_auto", 0.92))
+CLINIC_MATCH_FLOOR = float(CONFIG.get("clinic_match_floor", 0.60))
 
 
 def _client_or_none():
     global _client
     if _client is None and MODE == "live":
         import anthropic  # imported lazily so the stub path has zero deps
-        _client = anthropic.Anthropic()
+        _client = anthropic.Anthropic(api_key=_API_KEY)
     return _client
 
 
@@ -136,7 +145,7 @@ def llm_json(prompt: str, schema: dict, *, _stub: Optional[dict] = None) -> dict
 
     Deliberately the only LLM entry point so that cost, latency, retries and
     prompt versioning have exactly one place to live. With no ANTHROPIC_API_KEY
-    in the environment the call returns `_stub`, so the pipeline and its tests
+    (and only the placeholder in config.json) the call returns `_stub`, so the pipeline and its tests
     run end to end offline with identical control flow.
 
     Live policy: JSON-only system prompt, max 1 retry on a schema violation,
@@ -155,7 +164,7 @@ def llm_json(prompt: str, schema: dict, *, _stub: Optional[dict] = None) -> dict
         payload = None
         for attempt in range(2):
             msg = client.messages.create(
-                model=MODEL, max_tokens=1024, system=system,
+                model=MODEL, max_tokens=CONFIG.get("max_tokens", 1024), system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(b.text for b in msg.content if b.type == "text")
@@ -524,7 +533,7 @@ def run_demo() -> dict:
         log.removeHandler(h)
     return {
         "mode": MODE,
-        "model": MODEL if MODE == "live" else None,
+        "model": MODEL,
         "input_reviews": len(raws),
         "published": [to_dict(r) for r in results if not r.needs_human],
         "human_queue": [to_dict(r) for r in results if r.needs_human],

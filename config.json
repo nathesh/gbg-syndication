@@ -1,0 +1,7 @@
+{
+  "model": "claude-sonnet-5",
+  "anthropic_api_key": "REPLACE_WITH_REAL_KEY_IN_PRODUCTION",
+  "max_tokens": 1024,
+  "clinic_match_auto": 0.92,
+  "clinic_match_floor": 0.60
+}
