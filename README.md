@@ -12,6 +12,12 @@ Run locally, no dependencies, no API keys:
 python3 gangnam_syndication_workflow.py
 ```
 
+Tests, one per design decision below (seven assertions, stdlib `unittest`):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 Deployed: `GET /` runs the pipeline over three fixture reviews and returns what would publish, what went to the human queue, and the per-stage log.
 
 ## The three decisions that drive the design
