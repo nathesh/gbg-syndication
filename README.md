@@ -18,7 +18,19 @@ Tests, one per design decision below (seven assertions, stdlib `unittest`):
 python3 -m unittest discover -s tests -v
 ```
 
-Deployed: `GET /` runs the pipeline over three fixture reviews and returns what would publish, what went to the human queue, and the per-stage log.
+## Agent steps
+
+Three model calls, each behind the single `llm_json` boundary, each fed by the deterministic stage before it:
+
+| Step | Trigger | Model's job | Hands off to |
+|---|---|---|---|
+| Dedupe adjudicator | SimHash distance in the 4-8 band | "Same underlying review?" on two Korean texts | Clinic resolver (survivors only) |
+| Clinic resolver | No registration number, phone, or exact-name hit | Pick a catalog clinic + confidence | Translator (or human queue if < 0.92) |
+| Translator + claims check | Every surviving review | Translate with pinned glossary, then list any dropped complications | Trust scorer (flags if anything dropped) |
+
+With `ANTHROPIC_API_KEY` set the calls go to `claude-opus-5` (JSON-only system prompt, one retry on schema violation, then the stage escalates). Without a key the same control flow runs against fixed stubs, which is how the tests run. The response reports `"mode": "live" | "stub"`.
+
+Deployed: `GET /` runs the pipeline over three fixture reviews and returns what would publish, what went to the human queue, and the per-stage log. Set `ANTHROPIC_API_KEY` in the Vercel project for live mode.
 
 ## The three decisions that drive the design
 

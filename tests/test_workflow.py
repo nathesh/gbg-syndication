@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+os.environ.pop("ANTHROPIC_API_KEY", None)   # tests always run the offline path
 
 import gangnam_syndication_workflow as w  # noqa: E402
 

@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -106,6 +107,27 @@ class Review:
 # Model boundary -- one call site, schema-checked, never trusted raw
 # --------------------------------------------------------------------------
 
+MODEL = "claude-opus-5"
+MODE = "live" if os.environ.get("ANTHROPIC_API_KEY") else "stub"
+_client = None
+
+
+def _client_or_none():
+    global _client
+    if _client is None and MODE == "live":
+        import anthropic  # imported lazily so the stub path has zero deps
+        _client = anthropic.Anthropic()
+    return _client
+
+
+def _parse_json_block(text: str) -> dict:
+    """Models occasionally wrap JSON in a fence; take the outermost object."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < 0:
+        raise ValueError("no JSON object in model output")
+    return json.loads(text[start:end + 1])
+
+
 def llm_json(prompt: str, schema: dict, *, _stub: Optional[dict] = None) -> dict:
     """
     The single place a model is called. Returns parsed JSON validated against
@@ -113,17 +135,42 @@ def llm_json(prompt: str, schema: dict, *, _stub: Optional[dict] = None) -> dict
     normal event, not an exception path bolted on later.
 
     Deliberately the only LLM entry point so that cost, latency, retries and
-    prompt versioning have exactly one place to live. `_stub` lets the pipeline
-    run end to end offline for tests and for this demo.
+    prompt versioning have exactly one place to live. With no ANTHROPIC_API_KEY
+    in the environment the call returns `_stub`, so the pipeline and its tests
+    run end to end offline with identical control flow.
+
+    Live policy: JSON-only system prompt, max 1 retry on a schema violation,
+    then raise and let the stage escalate. Never retry unbounded.
     """
-    if _stub is not None:
+    if MODE != "live":
+        if _stub is None:
+            raise RuntimeError("no model available and no stub supplied")
         payload = _stub
-    else:  # pragma: no cover -- real call site
-        raise NotImplementedError(
-            "Wire to your provider here. Enforce: temperature=0, JSON mode, "
-            "max 1 retry on schema violation, then fall through to the "
-            "deterministic default. Never retry unbounded."
-        )
+    else:
+        client = _client_or_none()
+        keys = ", ".join(f"{k} ({t.__name__})" for k, t in schema.items())
+        system = ("You are one step in a review-syndication pipeline. Reply with a "
+                  f"single JSON object and nothing else. Required keys: {keys}.")
+        last_err: Optional[Exception] = None
+        payload = None
+        for attempt in range(2):
+            msg = client.messages.create(
+                model=MODEL, max_tokens=1024, system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(b.text for b in msg.content if b.type == "text")
+            try:
+                candidate = _parse_json_block(text)
+            except ValueError as e:
+                last_err = e
+                continue
+            if all(k in candidate for k in schema):
+                payload = candidate
+                break
+            last_err = ValueError(f"model omitted required keys on attempt {attempt + 1}")
+        if payload is None:
+            raise last_err or ValueError("model returned nothing usable")
+
     missing = [k for k in schema if k not in payload]
     if missing:
         raise ValueError(f"model omitted required keys {missing}")
@@ -207,8 +254,12 @@ def dedupe(reviews: list[Review]) -> list[Review]:
             if dist <= SIMHASH_AMBIGUOUS:
                 # Tier 3 -- only here do we spend a model call.
                 try:
+                    other_text = next(x.raw.body_ko for x in reviews if x.raw.id == other_id)
                     verdict = llm_json(
-                        f"Same underlying review? A/B Korean text...",
+                        "Are these two Korean reviews the same underlying review "
+                        "(same author experience, possibly lightly edited or reposted)? "
+                        "Judge on content, not wording.\n\n"
+                        f"A: {other_text}\n\nB: {r.raw.body_ko}",
                         {"same": bool, "why": str},
                         _stub={"same": False, "why": "different procedure date"},
                     )
@@ -261,8 +312,13 @@ def resolve_clinic(r: Review, catalog: list[Clinic]) -> Review:
             return r
 
     try:                                                # ambiguity band only
+        options = "\n".join(f"- {c.clinic_id}: {c.name_ko} / {c.name_en}" for c in catalog)
         verdict = llm_json(
-            f"Which catalog clinic is '{text}'? Return clinic_id and confidence.",
+            f"A Korean review names the clinic as: '{text}'.\n"
+            f"Catalog:\n{options}\n\n"
+            "Which catalog clinic_id is it, and how confident are you (0-1)? "
+            "Branch suffixes like 강남점 are the same clinic; a different district "
+            "prefix (강남 vs 신사) may be a different business. Be conservative.",
             {"clinic_id": str, "confidence": float},
             _stub={"clinic_id": catalog[0].clinic_id, "confidence": 0.71},
         )
@@ -299,8 +355,13 @@ GLOSSARY = {
 def translate(r: Review) -> Review:
     try:
         out = llm_json(
-            "Translate KO->EN. Preserve hedging and negative outcomes exactly. "
-            f"Use this glossary verbatim: {json.dumps(GLOSSARY, ensure_ascii=False)}",
+            "Translate this Korean review to English for a medical-tourism buyer. "
+            "Preserve hedging and negative outcomes exactly; do not soften complaints. "
+            f"Use this glossary verbatim: {json.dumps(GLOSSARY, ensure_ascii=False)}. "
+            "Then re-read your translation against the source and list in "
+            "dropped_claims any complication, side effect, or negative statement "
+            "the English lost (empty list if none).\n\n"
+            f"Review: {r.raw.body_ko}",
             {"body_en": str, "dropped_claims": list},
             _stub={"body_en": "[EN] " + r.raw.body_ko[:60], "dropped_claims": []},
         )
@@ -462,6 +523,8 @@ def run_demo() -> dict:
     finally:
         log.removeHandler(h)
     return {
+        "mode": MODE,
+        "model": MODEL if MODE == "live" else None,
         "input_reviews": len(raws),
         "published": [to_dict(r) for r in results if not r.needs_human],
         "human_queue": [to_dict(r) for r in results if r.needs_human],
